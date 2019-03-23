@@ -1,0 +1,180 @@
+在进行Cache规则匹配时，我们会用到CacheControlTable的对象，而这个对象时CC_table类的实例。来看一下CC_table的定义。
+    typedef ControlMatcher<CacheControlRecord,CacheControlResult> CC_table;
+ /****************************************************************************************
+ /*                                      ControlMatcher
+ /****************************************************************************************
+template <class Data, class MatchResult> class ControlMatcher
+{
+public:
+  ControlMatcher(const char *file_var, const char *name, const matcher_tags *tags,
+                 int flags_in = (ALLOW_HOST_TABLE | ALLOW_IP_TABLE | ALLOW_REGEX_TABLE | ALLOW_HOST_REGEX_TABLE | ALLOW_URL_TABLE));//构造函数，创建一个结构，并初始化规则表
+  ~ControlMatcher();
+  int BuildTable();//读取配置文件，构建规则表，一共有五种规则，会将规则分别加到不同的规则表中
+    首先会根据各自的规则数量给data_array分配对应的Data大小空间，然后通过各自的NewEntry方法将记录添加到data_array中。  
+int BuildTableFromString(char *str);
+  void Match(RequestData *rdata, MatchResult *result);
+  void Print()；
+
+  // private:
+  RegexMatcher<Data, MatchResult> *reMatch; //用于进行正则匹配
+  UrlMatcher<Data, MatchResult> *urlMatch;//用于进行URL匹配
+  HostMatcher<Data, MatchResult> *hostMatch;//用于匹配HOST
+  IpMatcher<Data, MatchResult> *ipMatch;//用于匹配IP，不支持IP段
+  HostRegexMatcher<Data, MatchResult> *hrMatch;//用于匹配host正则
+
+  const matcher_tags *config_tags = nullptr;
+  char config_file_path[PATH_NAME_MAX];//配置文件路径
+  int flags                = 0;
+  int m_numEntries         = 0; //规则记录总数
+  const char *matcher_name = "unknown"; // Used for Debug/Warning/Error messages
+}
+
+接下来介绍一下各类匹配器：
+  RegexMatcher reMatch：
+     pcre **re_array 解析后的正则表达式列表
+     char **re_str 未做解析的正则表达式语句列表
+     Data *data_array 配置记录数组
+     int array_len   记录总数，上述三个数组的大小是一样的
+     int num_el  记录表中实际的记录数
+  HostMatcher hostMatch：
+    HostLookUp *host_lookup // 用于进行host匹配的类，插入和查找的时候会将值反转，使用.分割，反向进行查找
+    HostLookUp：
+    HostBranch中分为如下几种类型：
+      HOST_TERMINAL ： 表示已经是最后一个了
+      HOST_HASH： 表示为一个hash表
+      HOST_INDEX：字符树
+      HOST_ARRAY: 字符串数组
+    HostBranch *root 为根节点，使用HOST_INDEX的方法，因为一般域的最后一部分都是比较短的字符串
+    然后从第二层开始，默认开始使用HOST_ARRAY，HOST_ARRAY是一个字符串数组，需要对字符串进行比较，
+    字符串数组的最大长度为8，若是插入时长度超过8，则会转为HASH。
+  UrlMatcher urlMatch：
+ 	  InkHashTable *url_ht ：使用hash来进行查找
+  IpMatcher ipMatcher：
+    IpMap ip_map: 底层实现结构为红黑树
+  HostRegexMatcher *hrMatch：
+    与HostMatcher结构一致，但是匹配的时候直接通过pcre来对正则进行匹配
+
+  各个Matcher的匹配如下：
+    RegexMatcher和HostRegexMatcher 都是调用pcre来对每条规则进行匹配
+    IPmatcher 调用ipmap来进行匹配
+    UrlMatcher直接调用hashtable进行匹配
+    HostMatcher调用HostLookUp的方法进行匹配
+    
+ /****************************************************************************************
+ /*                                      ControlMatcher
+ /****************************************************************************************
+ CacheControl可以成是一条缓存规则，
+ class CacheControlRecord : public ControlBase
+{
+public:
+  CacheControlRecord();
+  CacheControlType directive; //存放缓存规则动作
+  int time_arg;//缓存规则的时间参数
+  int cache_responses_to_cookies;
+  Result Init(matcher_line *line_info);//初始化规则
+  inkcoreapi void UpdateMatch(CacheControlResult *result, RequestData *rdata);//更新缓存规则结果
+  void Print();
+};
+
+ControlBase中主要定义了一些修饰器，在后续进行规则结果更新时会查找相应修饰器是否匹配
+class ControlBase
+{
+public:
+  struct Modifier {
+    enum Type {
+      MOD_INVALID,
+      MOD_PORT,
+      MOD_SCHEME,
+      MOD_PREFIX,
+      MOD_SUFFIX,
+      MOD_METHOD,
+      MOD_TIME,
+      MOD_SRC_IP,
+      MOD_IPORT,
+      MOD_TAG,
+      MOD_INTERNAL,
+    };
+    ...
+    ...
+    ...
+  };
+
+  ControlBase();
+  ~ControlBase();
+  const char *ProcessModifiers(matcher_line *line_info);
+  bool CheckModifiers(HttpRequestData *request_data);
+  bool CheckForMatch(HttpRequestData *request_data, int last_number);
+  void Print();
+  int line_num;
+  Modifier *findModOfType(Modifier::Type t) const;
+
+protected:
+  /// Get the text for the Scheme modifier, if any.
+  /// @return The text if present, 0 otherwise.
+  /// @internal Ugly but it's the only place external access is needed.
+  const char *getSchemeModText() const;
+
+private:
+  typedef std::vector<Modifier *> Array;
+  Array _mods;
+  const char *ProcessSrcIp(char *val, void **opaque_ptr);
+  const char *ProcessTimeOfDay(char *val, void **opaque_ptr);
+  const char *ProcessPort(char *val, void **opaque_ptr);
+
+  // Reset to default constructed state, free all allocations.
+  void clear();
+}
+
+ /****************************************************************************************
+ /*                                      ControlResult
+ /****************************************************************************************
+ class CacheControlResult 查询结果的结构体，记录缓存规则的查询结果
+class CacheControlResult
+{
+  int revalidate_after;
+  int pin_in_cache_for;//cache pin
+  int ttl_in_cache;//强制缓存时间
+  bool never_cache; //永不缓存
+  bool ignore_client_no_cache; //是否忽略客户端的no-cache header
+  bool ignore_server_no_cache;//是否忽略server端响应的no-cache header
+  bool ignore_client_cc_max_age;
+  int cache_responses_to_cookies; ///< Override for caching cookied responses.
+  //下面6个参数是在更新缓存规则匹配结果时，如果匹配到多条规则时，到底使用那条规则的。简单点说，就是排在前面的规则优先级高，但是never_cache
+  //会被ttl_in_cache覆盖
+  int reval_line;
+  int never_line;
+  int pin_line;
+  int ttl_line;
+  int ignore_client_line;
+  int ignore_server_line;
+};
+
+ /****************************************************************************************
+ /*                                     Build CacheControlTable
+ /****************************************************************************************
+ CC_table 在创建实例时，会调用ControlMatcher的构造函数来读取配置文件
+   ControlMatcher==>BuildTable==>BuildTableFromString
+   ControlMatcher::BuildTtableFromString:
+     1. 按行读取规则，判断Match类型，并将所有规则放到一个matcher_line的链表中
+     2. 各个Matcher对象根据从1中得到的数量分配内存空间，在这里会创建指定数量的CacheControlRecord的数组
+     3. 遍历matcher_line链表，调用各个Matcher的NewEntry方法，将规则插入到Entry中
+       ** Matcher::NerEntry(matcher_line *):
+          在各个Matcher对象的NewEntry方法中，会调用CacheControlRecord的Init方法来初始化规则对象
+       ****ControlMatcher::init(matcher_line *):
+          先解析action,revalidate,pin-in-cache,ttl-in-cache等项，然后再解析修饰器
+            
+ /****************************************************************************************
+ /*                                     Match CacheControlTable
+ /****************************************************************************************
+ HttpTranact调用ControlMatcher::match方法来进行缓存规则的匹配
+   ** ControlMatcher::match(RequestData *,Result *)
+       在该方法中，会依次调用各个Matcher::match来进行规则的查找，按照设计来说，各个Matcher的调用顺序是
+       没有关系的，最后设置规则的时候会根据行号优先的规则来匹配
+   ****Matcher::match(RequestData *,Result *)
+         首先查找命中的规则，如果命中了，则调用CacheControlRecord::UpdateMatch方法来更新规则
+   ******CacheControlRecord::UpdateMatch(CacheControlResult *result, RequestData *rData)
+          该方法中，会通过CheckForMatch方法来判断是否需要更新result中的结果，因为有可能一个请求命中了多条缓存规则
+          在CheckForMatch中主要有两个判断，第一是判断有没有在该行规则之前的规则已经命中了，若存在，则放弃修改；第二是判断
+          是否能够匹配修饰器的规则，若是没有命中，也放弃修改。
+          但是存在一个特例，就是ttl-in-cache的规则会覆盖掉never-cache的规则。
+ 
